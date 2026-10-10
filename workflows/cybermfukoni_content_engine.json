@@ -1,0 +1,1227 @@
+{
+  "name": "Cyber Mfukoni — Content Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "45 7 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "d2651c27-700b-59f4-9074-e9b6c207b9fc",
+      "name": "Weekday 07:45 EAT",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Config\" — edit these values after import. Secrets live in n8n credentials, not here.\nreturn [{\n  json: {\n    siteBase: 'https://www.cybermfukoni.co.ke',\n    sitemapUrl: 'https://www.cybermfukoni.co.ke/sitemap.xml',\n    ogImageEndpoint: 'https://www.cybermfukoni.co.ke/api/og',   // must return image/jpeg for Instagram\n    blogWebhookUrl: 'https://www.cybermfukoni.co.ke/api/engine/posts',\n    facebookPageId: 'REPLACE_PAGE_ID',\n    instagramUserId: 'REPLACE_IG_USER_ID',\n    metaGraphVersion: 'v23.0',\n    telegramReviewerChatId: 'REPLACE_CHAT_ID',\n    gscProperty: 'sc-domain:cybermfukoni.co.ke',\n    channels: ['blog', 'facebook', 'instagram', 'x'],   // remove one to skip it (do not disable nodes)\n    llmModel: 'claude-sonnet-5-5',\n    maxAttempts: 3,          // 1 generation + 2 compliance-driven revisions\n    cooldownDays: 30,\n    // Verified windows only. MM-DD inclusive; may wrap the year end.\n    seasonal: [\n      { name: 'KRA individual income tax returns (deadline 30 June)', start: '05-15', end: '06-30',\n        tokens: ['kra', 'returns', 'tax', 'itax', 'nil', 'p9'], boost: 1 },\n    ],\n  },\n}];\n"
+      },
+      "id": "34aec9b5-1f11-59a7-86d6-93a009280584",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Config').first().json.sitemapUrl }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "87e89810-cf7d-5af0-9225-e1bffd419c9d",
+      "name": "Fetch Sitemap",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://www.googleapis.com/webmasters/v3/sites/{{ encodeURIComponent($('Config').first().json.gscProperty) }}/searchAnalytics/query",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ startDate: new Date(Date.now() - 31*864e5).toISOString().slice(0,10), endDate: new Date(Date.now() - 3*864e5).toISOString().slice(0,10), dimensions: ['page'], rowLimit: 25000 }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "f7be92c3-58c5-5866-a8b7-db1317fe4921",
+      "name": "GSC Page Stats",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "credentials": {
+        "oAuth2Api": {
+          "id": "",
+          "name": "Google Search Console (webmasters.readonly)"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Select Target\" — rank services from the live sitemap (mirrors cm_agent/demand.py).\n// score = 0.45*GSC striking-distance + 0.30*seasonal + 0.25*coverage gap; cooldown via static data.\nconst cfg = $('Config').first().json;\nconst xml = String($('Fetch Sitemap').first().json.data || '');\nlet gscRows = [];\ntry { gscRows = $('GSC Page Stats').first().json.rows || []; } catch (e) { gscRows = []; }\n\nconst host = new URL(cfg.siteBase).host;\nconst SERVICE = /^\\/government-agencies\\/([^/]+)\\/service\\/([^/]+)\\/?$/;\nconst BLOG = /^\\/blog\\/((?!category\\/)[^/]+)\\/?$/;\nconst services = [];\nconst blogSlugs = [];\nfor (const m of xml.matchAll(/<loc>\\s*([^<\\s]+)\\s*<\\/loc>/g)) {\n  let u;\n  try { u = new URL(m[1]); } catch (e) { continue; }\n  if (u.host !== host) continue;\n  const s = u.pathname.match(SERVICE);\n  if (s) { services.push({ url: u.href, agency: s[1], slug: s[2] }); continue; }\n  const b = u.pathname.match(BLOG);\n  if (b) blogSlugs.push(b[1]);\n}\nif (!services.length) throw new Error('Sitemap returned no service URLs');\n\nconst tokens = (slug) => new Set(slug.toLowerCase().split(/[-_]/).filter((t) => t.length > 2));\nconst jaccard = (a, b) => {\n  const inter = [...a].filter((x) => b.has(x)).length;\n  const union = new Set([...a, ...b]).size;\n  return union ? inter / union : 0;\n};\n\n// Today in EAT (Africa/Nairobi, UTC+3, no DST).\nconst nowEat = new Date(Date.now() + 3 * 3600 * 1000);\nconst mmdd = (d) => [d.getUTCMonth() + 1, d.getUTCDate()];\nconst [tm, td] = mmdd(nowEat);\nconst inWindow = (start, end) => {\n  const v = tm * 100 + td;\n  const [sm, sd] = start.split('-').map(Number);\n  const [em, ed] = end.split('-').map(Number);\n  const s = sm * 100 + sd, e = em * 100 + ed;\n  return s <= e ? v >= s && v <= e : v >= s || v <= e;\n};\n\nconst gsc = {};\nfor (const r of gscRows) gsc[r.keys[0]] = r;\nconst gscRaw = (r) => (r ? r.impressions * (r.position >= 4 && r.position <= 20 ? 1 : 0.25) : 0);\n\nconst store = $getWorkflowStaticData('global');\nstore.history = store.history || {};\nconst cutoff = Date.now() - cfg.cooldownDays * 86400 * 1000;\n\nconst rows = services.filter((s) => !(store.history[s.slug] && Date.parse(store.history[s.slug]) >= cutoff));\nconst maxG = Math.max(0, ...rows.map((s) => gscRaw(gsc[s.url]))) || 1;\nconst blogTok = blogSlugs.map(tokens);\n\nconst ranked = rows.map((s) => {\n  const t = tokens(s.slug);\n  const g = gscRaw(gsc[s.url]) / maxG;\n  let seasonal = 0;\n  const reasons = [];\n  for (const ev of cfg.seasonal) {\n    if (inWindow(ev.start, ev.end) && ev.tokens.some((x) => t.has(x)) && ev.boost > seasonal) {\n      seasonal = Math.min(ev.boost, 1);\n      reasons.push(`seasonal: ${ev.name}`);\n    }\n  }\n  const gap = t.size ? 1 - Math.max(0, ...blogTok.map((b) => jaccard(t, b))) : 0;\n  if (g > 0) {\n    const r = gsc[s.url];\n    reasons.push(`gsc: ${Math.round(r.impressions)} impr, pos ${r.position.toFixed(1)}, ctr ${(r.ctr * 100).toFixed(2)}%`);\n  }\n  if (gap >= 0.8) reasons.push('no matching blog post');\n  return { ...s, score: +(0.45 * g + 0.3 * seasonal + 0.25 * gap).toFixed(4), reasons };\n}).sort((a, b) => b.score - a.score || a.slug.localeCompare(b.slug));\n\nif (!ranked.length) return [{ json: { noCandidate: true, reason: 'all services in cooldown' } }];\nreturn [{ json: { noCandidate: false, target: ranked[0], runnersUp: ranked.slice(1, 5), blogSlugs } }];\n"
+      },
+      "id": "69b82b28-7aa8-5f2b-a355-38616659af27",
+      "name": "Select Target",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ !$json.noCandidate }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "a3db96e9-e461-5b2d-a6a1-7cf4d51bef68",
+      "name": "Has Target?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.target.url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "91927ae9-141c-5037-b127-965089df24dc",
+      "name": "Fetch Service Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1320,
+        280
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Extract Facts\" — deterministic facts from the target page (mirrors cm_agent/catalog.py).\n// Price/turnaround come ONLY from the text between the H1 and the next h1-h4 heading,\n// which keeps cross-sell prices (e.g. eCitizen setup) out.\nconst sel = $('Select Target').first().json;\nconst t = sel.target;\nconst html = String($('Fetch Service Page').first().json.data || '');\n\nconst decode = (s) => s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')\n  .replace(/&quot;/g, '\"').replace(/&#39;|&#x27;/g, \"'\").replace(/&nbsp;/g, ' ');\nconst text = (s) => decode(s.replace(/<!--[\\s\\S]*?-->/g, ' ').replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n  .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ').replace(/<[^>]+>/g, ' ')).replace(/\\s+/g, ' ').trim();\n\nconst h1m = html.match(/<h1\\b[^>]*>([\\s\\S]*?)<\\/h1>/i);\nconst titleM = html.match(/<title[^>]*>([\\s\\S]*?)<\\/title>/i);\nconst metaM = html.match(/<meta[^>]+name=[\"']description[\"'][^>]*content=[\"']([^\"']*)[\"']/i);\nlet block = '';\nif (h1m) {\n  const after = html.slice(h1m.index + h1m[0].length);\n  const stop = after.search(/<h[1-4]\\b/i);\n  block = text(stop >= 0 ? after.slice(0, stop) : after).slice(0, 600);\n}\nconst amounts = [...block.matchAll(/\\b(?:KES|Kshs?\\.?)\\s*([\\d,]+(?:\\.\\d{2})?)/gi)]\n  .map((m) => Math.round(parseFloat(m[1].replace(/,/g, ''))));\nconst days = [...block.matchAll(/\\b(\\d{1,3})\\s*(?:working\\s+)?days?\\b/gi)].map((m) => parseInt(m[1], 10));\n\nlet documents = [];\nconst docH = html.match(/<h[2-4]\\b[^>]*>[^<]*(?:Require|Document)[^<]*<\\/h[2-4]>([\\s\\S]*?)<\\/(?:ul|ol)>/i);\nif (docH) documents = [...docH[1].matchAll(/<li\\b[^>]*>([\\s\\S]*?)<\\/li>/gi)].map((m) => text(m[1])).slice(0, 12);\n\nlet requestUrl = `https://app.cybermfukoni.co.ke/service-requests/create?agency=${t.agency}&service=${t.slug}`;\nfor (const m of html.matchAll(/href=[\"']([^\"']*service-requests\\/create[^\"']*)[\"']/gi)) {\n  const href = decode(m[1]);\n  try { if (new URL(href).searchParams.get('service') === t.slug) { requestUrl = href; break; } } catch (e) { /* skip */ }\n}\n\nconst priceAmbiguous = new Set(amounts).size > 1;\nreturn [{\n  json: {\n    agency: t.agency,\n    slug: t.slug,\n    url: t.url,\n    requestUrl,\n    reasons: t.reasons,\n    blogSlugs: sel.blogSlugs,\n    h1: h1m ? text(h1m[1]) : '',\n    title: titleM ? text(titleM[1]) : '',\n    metaDescription: metaM ? decode(metaM[1]) : '',\n    priceKes: amounts.length ? amounts[0] : null,\n    priceAmbiguous,\n    turnaroundDays: days.length ? days[0] : null,\n    documents,\n  },\n}];\n"
+      },
+      "id": "3808486f-21ba-51b6-a8b2-11902264ec5f",
+      "name": "Extract Facts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Build LLM Request\" — first pass from Extract Facts; later passes receive the\n// compliance output (violations) through the revision loop.\nconst cfg = $('Config').first().json;\nconst f = $('Extract Facts').first().json;\nconst incoming = $input.first().json;\nconst feedback = Array.isArray(incoming.violations) ? incoming.violations : [];\nconst attempt = (incoming.attempt || 0) + 1;\n\nconst system = `You are the content strategist for Cyber Mfukoni, an independent private\nconsultancy in Kenya that helps citizens and businesses complete government processes\n(eCitizen, KRA, NTSA, BRS, TSC, KUCCPS and others) for a service fee.\nAudience: Kenyans on mobile, often first-time portal users. Voice: clear Kenyan English;\nsocial posts may use light, natural Sheng/Swahili phrases.\n\nHARD RULES (violations are rejected automatically):\n1. Fees and turnaround: state ONLY the values in FACTS, written exactly as \"KES <amount>\" and\n   \"<n> days\". If FACTS gives null, mention no amount and no number of days. No statutory fees.\n2. Never imply affiliation with, approval by, or acting on behalf of any government body.\n   Never use \"official\", \"guarantee\", \"100% approval\", \"skip the queue\".\n3. Links: only the placeholders {{CTA}} (request form) and {{SERVICE_PAGE}} (service page).\n   Never write raw URLs. Instagram caption: no links, say \"link in bio\".\n4. Do not invent requirements; use FACTS.documents or refer readers to the service page.\n5. Blog: step-by-step guide, H2/H3 only, >= 600 words, 3-6 FAQs.\n\nOUTPUT: a single JSON object and nothing else, exactly this shape:\n{\"primary_keyword\": str,\n \"blog\": {\"title\": str (<=60 chars), \"slug\": str (lowercase-hyphenated, unique),\n          \"meta_description\": str (70-160 chars), \"body_markdown\": str (uses {{SERVICE_PAGE}} once,\n          ends with a call to action linking {{CTA}}), \"faqs\": [{\"question\": str, \"answer\": str}] (3-6)},\n \"facebook_post\": str (80-180 words, ends with {{CTA}}),\n \"x_post\": str (<= 250 chars including {{CTA}}),\n \"instagram_caption\": str (<= 1500 chars),\n \"instagram_hashtags\": [str] (3-8, no # prefix),\n \"tiktok\": {\"hook\": str, \"beats\": [str] (3-6), \"on_screen_text\": [str] (3-6), \"cta\": str}}`;\n\nconst facts = {\n  service_name: f.h1 || f.title,\n  agency_slug: f.agency,\n  fee_kes: f.priceAmbiguous ? null : f.priceKes,\n  turnaround_days: f.turnaroundDays,\n  documents: f.documents,\n  page_summary: f.metaDescription,\n  existing_blog_slugs_to_avoid: f.blogSlugs.slice(0, 200),\n};\nlet user = `FACTS:\\n${JSON.stringify(facts, null, 2)}\\n\\nWHY THIS SERVICE NOW:\\n` +\n  ((f.reasons || []).map((r) => `- ${r}`).join('\\n') || '- rotation');\nif (feedback.length) {\n  user += '\\n\\nYOUR PREVIOUS DRAFT WAS REJECTED BY THE COMPLIANCE GATE. Fix every item and change ' +\n    'nothing else unnecessarily:\\n' + feedback.map((v) => `- [${v.channel}] ${v.rule}: ${v.detail}`).join('\\n');\n}\n\nreturn [{\n  json: {\n    attempt,\n    body: {\n      model: cfg.llmModel,\n      max_tokens: 8000,\n      temperature: 0.4,\n      system,\n      messages: [{ role: 'user', content: user }],\n    },\n  },\n}];\n"
+      },
+      "id": "d9d5b964-b36c-5534-aec8-d8fd7ee6abea",
+      "name": "Build LLM Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "331c370f-d0ca-5d7a-8e43-17b411898d63",
+      "name": "Anthropic Messages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        280
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Anthropic x-api-key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Assemble + Compliance\" — parse LLM JSON, insert tracked links, disclaimer, JSON-LD,\n// then run the deterministic gate (mirrors cm_agent/assemble.py + compliance.py).\nconst cfg = $('Config').first().json;\nconst f = $('Extract Facts').first().json;\nconst attempt = $runIndex + 1;\nconst executionId = $execution.id;\nconst resp = $input.first().json;\n\nconst violations = [];\nconst V = (channel, rule, detail) => violations.push({ channel, rule, detail });\n\n// ---------- parse + shape validation\nlet pack = null;\ntry {\n  if (resp.error) throw new Error(`LLM HTTP error: ${JSON.stringify(resp.error).slice(0, 300)}`);\n  const txt = (resp.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('');\n  const s = txt.indexOf('{'), e = txt.lastIndexOf('}');\n  if (s < 0 || e <= s) throw new Error('no JSON object in response');\n  pack = JSON.parse(txt.slice(s, e + 1));\n  const str = (v) => typeof v === 'string' && v.trim().length > 0;\n  const arr = (v) => Array.isArray(v);\n  const ok = pack && str(pack.primary_keyword) && pack.blog && str(pack.blog.title) && str(pack.blog.slug)\n    && str(pack.blog.meta_description) && str(pack.blog.body_markdown) && arr(pack.blog.faqs)\n    && pack.blog.faqs.every((q) => str(q.question) && str(q.answer))\n    && str(pack.facebook_post) && str(pack.x_post) && str(pack.instagram_caption)\n    && arr(pack.instagram_hashtags) && pack.tiktok && str(pack.tiktok.hook) && arr(pack.tiktok.beats)\n    && arr(pack.tiktok.on_screen_text) && str(pack.tiktok.cta);\n  if (!ok) throw new Error('JSON does not match the required shape');\n} catch (err) {\n  V('all', 'SCHEMA_INVALID', String(err.message || err));\n  return [{ json: { passed: false, attempt, violations, maxAttempts: cfg.maxAttempts } }];\n}\n\n// ---------- assemble\nconst utm = (url, source, medium) => {\n  const u = new URL(url);\n  u.searchParams.set('utm_source', source);\n  u.searchParams.set('utm_medium', medium);\n  u.searchParams.set('utm_campaign', 'cm_engine');\n  u.searchParams.set('utm_content', `n8n-${executionId}`);\n  return u.toString();\n};\nconst fill = (t, cta, page) => t.split('{{CTA}}').join(cta).split('{{SERVICE_PAGE}}').join(page);\nconst DISCLAIMER = '\\n\\n---\\n\\n*Cyber Mfukoni is an independent private consultancy. We are not affiliated '\n  + 'with the Government of Kenya or any state agency. Every service listed here can also be accessed '\n  + 'directly through the relevant government portal; our fee covers professional assistance in addition '\n  + 'to any statutory charges.*';\nconst priceOk = f.priceKes !== null && !f.priceAmbiguous;\n\nconst serviceLd = {\n  '@context': 'https://schema.org', '@type': 'Service', name: f.h1 || f.title, url: f.url,\n  areaServed: { '@type': 'Country', name: 'Kenya' },\n  provider: { '@type': 'Organization', name: 'Cyber Mfukoni', url: cfg.siteBase },\n};\nif (priceOk) serviceLd.offers = { '@type': 'Offer', price: String(f.priceKes), priceCurrency: 'KES', url: f.requestUrl };\nconst faqLd = {\n  '@context': 'https://schema.org', '@type': 'FAQPage',\n  mainEntity: pack.blog.faqs.map((q) => ({ '@type': 'Question', name: q.question,\n    acceptedAnswer: { '@type': 'Answer', text: q.answer } })),\n};\nconst hashtags = pack.instagram_hashtags.map((h) => '#' + String(h).replace(/^#/, '').replace(/\\s+/g, '')).join(' ');\nconst content = {\n  primary_keyword: pack.primary_keyword,\n  blog: {\n    title: pack.blog.title,\n    slug: pack.blog.slug,\n    canonical_url: `${cfg.siteBase}/blog/${pack.blog.slug}`,\n    meta_description: pack.blog.meta_description,\n    body_markdown: fill(pack.blog.body_markdown, utm(f.requestUrl, 'blog', 'owned'), utm(f.url, 'blog', 'owned')) + DISCLAIMER,\n    faqs: pack.blog.faqs,\n    jsonld: [serviceLd, faqLd],\n    og_image: `${cfg.ogImageEndpoint}?title=${encodeURIComponent(pack.blog.title)}`,\n  },\n  facebook: {\n    message: fill(pack.facebook_post, utm(f.requestUrl, 'facebook', 'social'), utm(f.url, 'facebook', 'social')),\n    link: utm(f.requestUrl, 'facebook', 'social'),\n  },\n  x: { text: fill(pack.x_post, utm(f.requestUrl, 'x', 'social'), utm(f.url, 'x', 'social')) },\n  instagram: {\n    caption: `${fill(pack.instagram_caption, 'link in bio', 'link in bio')}\\n\\n${hashtags}`.trim(),\n    image_url: `${cfg.ogImageEndpoint}?title=${encodeURIComponent(f.h1 || pack.blog.title)}`,\n  },\n  tiktok: pack.tiktok,\n};\n\n// ---------- compliance\nconst AMOUNT = /\\b(?:KES|KSh|Kshs?)\\.?\\s*([\\d,]+(?:\\.\\d{1,2})?)|\\b([\\d,]+)\\s*(?:shillings|bob)\\b/gi;\nconst DAYS = /\\b(\\d{1,3})\\s*(?:working\\s+|business\\s+)?days?\\b/gi;\nconst URLRX = /https?:\\/\\/[^\\s)\\]>\"']+/gi;\nconst AG = '(?:kra|ntsa|ecitizen|e-citizen|government|gok|tsc|kuccps|helb|immigration|nrb|brs|sha|nssf|police|dci)';\nconst IMPERSONATION = [\n  new RegExp(`\\\\bofficial\\\\s+${AG}\\\\b`, 'gi'),\n  new RegExp(`\\\\b${AG}[- ](?:approved|accredited|certified|authori[sz]ed)\\\\b`, 'gi'),\n  new RegExp(`\\\\b(?:approved|accredited|authori[sz]ed|licensed)\\\\s+(?:by|agents?\\\\s+of)\\\\s+(?:the\\\\s+)?${AG}\\\\b`, 'gi'),\n  new RegExp(`\\\\bwe\\\\s+are\\\\s+(?:the\\\\s+)?${AG}\\\\b`, 'gi'),\n  new RegExp(`\\\\bon\\\\s+behalf\\\\s+of\\\\s+(?:the\\\\s+)?${AG}\\\\b`, 'gi'),\n  /\\bguarantee(?:d|s)?\\b/gi,\n  /\\b100\\s*%\\s*(?:approval|success|guaranteed)\\b/gi,\n  /\\b(?:skip|jump|beat)\\s+the\\s+queue\\b/gi,\n];\nconst xWeighted = (t) => {\n  const urls = t.match(URLRX) || [];\n  let n = 23 * urls.length;\n  for (const ch of t.replace(URLRX, '')) {\n    const cp = ch.codePointAt(0);\n    const light = cp <= 0x10ff || (cp >= 0x2000 && cp <= 0x200d) || (cp >= 0x2010 && cp <= 0x201f)\n      || (cp >= 0x2032 && cp <= 0x2037);\n    n += light ? 1 : 2;\n  }\n  return n;\n};\n\nconst b = content.blog;\nconst texts = {\n  blog: [b.title, b.meta_description, b.body_markdown, ...b.faqs.map((q) => `${q.question}\\n${q.answer}`)].join('\\n'),\n  facebook: content.facebook.message,\n  x: content.x.text,\n  instagram: content.instagram.caption,\n  tiktok: [content.tiktok.hook, ...content.tiktok.beats, ...content.tiktok.on_screen_text, content.tiktok.cta].join('\\n'),\n};\nfor (const [ch, t] of Object.entries(texts)) {\n  for (const m of t.matchAll(AMOUNT)) {\n    const amt = Math.round(parseFloat((m[1] || m[2]).replace(/,/g, '')));\n    if (!(priceOk && amt === f.priceKes)) V(ch, 'FEE_MISMATCH', `'${m[0]}' not in catalog fee ${priceOk ? f.priceKes : 'none-allowed'}`);\n  }\n  for (const m of t.matchAll(DAYS)) {\n    if (parseInt(m[1], 10) !== f.turnaroundDays) V(ch, 'TURNAROUND_MISMATCH', `'${m[0]}' not in catalog turnaround ${f.turnaroundDays ?? 'none-allowed'}`);\n  }\n  for (const rx of IMPERSONATION) for (const m of t.matchAll(rx)) V(ch, 'IMPERSONATION_OR_CLAIM', `'${m[0]}'`);\n  for (const url of t.match(URLRX) || []) {\n    let h = '';\n    try { h = new URL(url).hostname.toLowerCase(); } catch (e) { /* invalid */ }\n    if (!(h === 'cybermfukoni.co.ke' || h.endsWith('.cybermfukoni.co.ke') || h.endsWith('.go.ke'))) V(ch, 'DISALLOWED_LINK', url);\n  }\n  if (t.includes('{{') || t.includes('}}')) V(ch, 'UNFILLED_PLACEHOLDER', 'template token left in output');\n}\nif (b.title.length > 60) V('blog', 'TITLE_LENGTH', `${b.title.length} > 60`);\nif (b.meta_description.length < 70 || b.meta_description.length > 160) V('blog', 'META_LENGTH', `${b.meta_description.length} not in [70, 160]`);\nif (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(b.slug)) V('blog', 'SLUG_FORMAT', b.slug);\nif ((f.blogSlugs || []).includes(b.slug)) V('blog', 'SLUG_COLLISION', b.slug);\nconst words = (b.body_markdown.match(/\\w+/g) || []).length;\nif (words < 600) V('blog', 'BODY_TOO_SHORT', `${words} < 600 words`);\nconst card = [['faqs', b.faqs.length, 3, 6, 'blog'], ['tiktok_beats', content.tiktok.beats.length, 3, 6, 'tiktok'],\n  ['tiktok_on_screen_text', content.tiktok.on_screen_text.length, 3, 6, 'tiktok'],\n  ['instagram_hashtags', pack.instagram_hashtags.length, 3, 8, 'instagram']];\nfor (const [label, n, lo, hi, ch] of card) if (n < lo || n > hi) V(ch, 'CARDINALITY', `${label}: ${n} not in [${lo}, ${hi}]`);\nconst xw = xWeighted(content.x.text);\nif (xw > 280) V('x', 'X_LENGTH', `${xw} > 280 weighted chars`);\nif (content.instagram.caption.length > 2200) V('instagram', 'IG_CAPTION_LENGTH', '> 2200');\n\nreturn [{ json: { passed: violations.length === 0, attempt, maxAttempts: cfg.maxAttempts, violations, content } }];\n"
+      },
+      "id": "85caf95f-724b-5af4-bce8-a185036adee9",
+      "name": "Assemble + Compliance",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.passed }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "2d89f3c6-cdcf-56f0-8bc2-33dc2fcd1bf6",
+      "name": "Passed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        2420,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.attempt }}",
+              "operation": "smaller",
+              "value2": "={{ $json.maxAttempts }}"
+            }
+          ]
+        }
+      },
+      "id": "6e2b646c-33b5-58ba-b99e-8faf1e9813ae",
+      "name": "Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        2640,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Blocked Message\" — compliance still failing after maxAttempts.\nconst f = $('Extract Facts').first().json;\nconst { violations, attempt } = $input.first().json;\nconst esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst lines = violations.slice(0, 15).map((v) => `• [${esc(v.channel)}] ${esc(v.rule)}: ${esc(v.detail).slice(0, 160)}`);\nreturn [{\n  json: {\n    violations,\n    text: [`<b>⛔ Blocked: ${esc(f.h1 || f.slug)}</b>`, `Compliance failed after ${attempt} attempts:`, ...lines,\n      `Execution <code>${$execution.id}</code>`].join('\\n').slice(0, 4096),\n  },\n}];\n"
+      },
+      "id": "086d5ca7-7bfc-5742-ab8d-f8dd26e233a8",
+      "name": "Blocked Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegramReviewerChatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true,
+          "appendAttribution": false
+        }
+      },
+      "id": "348379f5-1bb9-5942-800e-bfeb735b1bde",
+      "name": "Telegram Blocked",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3080,
+        560
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram reviewer bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Record Outcome\" — rejected / expired / blocked runs. No cooldown is applied,\n// so the service stays eligible; the log keeps the reason for audit.\n// Decision path: $input is the Verify Decision item. Blocked path: $input is the Telegram response.\nconst store = $getWorkflowStaticData('global');\nstore.log = store.log || [];\nconst f = $('Extract Facts').first().json;\nconst j = $input.first().json;\nconst entry = { executionId: $execution.id, slug: f.slug, status: j.decision || 'blocked', at: new Date().toISOString() };\nif (!j.decision) entry.violations = $('Blocked Message').first().json.violations;\nstore.log.push(entry);\nif (store.log.length > 500) store.log = store.log.slice(-500);\nreturn [{ json: entry }];\n"
+      },
+      "id": "e8338fbd-a1e5-5d1e-a9a8-44400d784080",
+      "name": "Record Outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4180,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Prepare Review\" — receives the PASSING compliance item. Builds the Telegram preview and\n// signed one-time approve/reject links to this execution's Wait node.\n// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto.\nconst crypto = require('crypto');\nconst f = $('Extract Facts').first().json;\nconst { content, attempt } = $input.first().json;\nconst token = crypto.randomBytes(24).toString('hex');\nconst base = $execution.resumeUrl;          // {N8N_URL}/webhook-waiting/{executionId}\nconst link = (d) => `${base}?d=${d}&t=${token}`;\n\nconst esc = (s, n) => {\n  const t = String(s ?? '');\n  const cut = t.length > n ? t.slice(0, n - 1) + '…' : t;\n  return cut.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n};\nconst text = [\n  `<b>Review: ${esc(f.h1 || f.slug, 120)}</b>`,\n  `Fee: ${f.priceAmbiguous ? 'ambiguous (not mentioned)' : f.priceKes ?? 'n/a'} | Turnaround: ${f.turnaroundDays ?? 'n/a'} days | Attempt ${attempt}`,\n  `Why: ${esc((f.reasons || []).join('; ') || 'rotation', 300)}`,\n  '',\n  `<b>Blog</b>: ${esc(content.blog.title, 120)}`,\n  `<b>X</b>: ${esc(content.x.text, 300)}`,\n  `<b>Facebook</b>: ${esc(content.facebook.message, 900)}`,\n  `<b>Instagram</b>: ${esc(content.instagram.caption, 600)}`,\n  '',\n  `Execution <code>${$execution.id}</code> · links expire in 48 h`,\n].join('\\n').slice(0, 4096);\n\nreturn [{\n  json: {\n    token, text, approveUrl: link('approve'), rejectUrl: link('reject'),\n    slug: f.slug, content,\n  },\n}];\n"
+      },
+      "id": "ee5b4797-5260-52f3-9db0-48339a5d318c",
+      "name": "Prepare Review",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegramReviewerChatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true,
+          "appendAttribution": false
+        },
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✅ Approve",
+                    "additionalFields": {
+                      "url": "={{ $json.approveUrl }}"
+                    }
+                  },
+                  {
+                    "text": "❌ Reject",
+                    "additionalFields": {
+                      "url": "={{ $json.rejectUrl }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "id": "378463ea-b387-5eaf-a2fb-7e7ab91e6e92",
+      "name": "Telegram Review",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2860,
+        200
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram reviewer bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "httpMethod": "GET",
+        "limitWait": true,
+        "limitType": "afterTimeInterval",
+        "resumeAmount": 48,
+        "resumeUnit": "hours",
+        "options": {}
+      },
+      "id": "db280b42-d7b7-5956-8aaf-d2597b917db1",
+      "name": "Wait for Decision",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3080,
+        200
+      ],
+      "webhookId": "623b166c-831a-5147-8a14-b9313ed14d6c"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Verify Decision\" — runs after the Wait node resumes (link click) or times out.\n// Constant-time token comparison; a bad token loops back to the Wait node.\nconst crypto = require('crypto');\nconst expected = $('Prepare Review').first().json.token;\nconst q = ($input.first().json && $input.first().json.query) || {};\nlet decision = 'expired';                       // Wait timeout resumes with no query\nif (q.t !== undefined || q.d !== undefined) {\n  const a = Buffer.from(String(q.t || ''));\n  const b = Buffer.from(expected);\n  const valid = a.length === b.length && crypto.timingSafeEqual(a, b);\n  decision = !valid ? 'invalid' : (q.d === 'approve' ? 'approve' : q.d === 'reject' ? 'reject' : 'invalid');\n}\nreturn [{ json: { decision } }];\n"
+      },
+      "id": "0c65e766-47b9-5501-bd18-b99680abdff1",
+      "name": "Verify Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3300,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.decision }}",
+              "value2": "approve"
+            }
+          ]
+        }
+      },
+      "id": "ca7e972b-5bd4-56f4-9979-9fa12a635829",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        3520,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.decision }}",
+              "value2": "invalid"
+            }
+          ]
+        }
+      },
+      "id": "9493a0e3-a609-5d48-b290-cdb2fbc37ab9",
+      "name": "Invalid Token?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        3740,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $('Config').first().json.channels.includes('blog') }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "b54a637d-809b-5a80-9924-710ad870e10d",
+      "name": "Blog Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        3740,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Sign Blog Payload\" — HMAC-SHA256 over `${ts}.${body}` (docs/blog-ingestion-contract.md).\n// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto and env CM_BLOG_WEBHOOK_SECRET readable by Code nodes.\nconst crypto = require('crypto');\nconst secret = $env.CM_BLOG_WEBHOOK_SECRET;\nif (!secret) throw new Error('CM_BLOG_WEBHOOK_SECRET is not set (or env access is blocked)');\nconst b = $('Prepare Review').first().json.content.blog;\nconst payload = {\n  slug: b.slug, title: b.title, meta_description: b.meta_description, body_markdown: b.body_markdown,\n  faqs: b.faqs, jsonld: b.jsonld, og_image: b.og_image, canonical_url: b.canonical_url,\n};\nconst body = JSON.stringify(payload);\nconst ts = String(Math.floor(Date.now() / 1000));\nconst sig = crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');\nreturn [{ json: { body, ts, signature: `sha256=${sig}`, slug: b.slug } }];\n"
+      },
+      "id": "3386a8fd-ae00-52c6-a408-0c94e724e40f",
+      "name": "Sign Blog Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3960,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.blogWebhookUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-CM-Timestamp",
+              "value": "={{ $json.ts }}"
+            },
+            {
+              "name": "X-CM-Signature",
+              "value": "={{ $json.signature }}"
+            },
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.slug }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "bc647292-a039-50d0-9451-ddff4bb6a601",
+      "name": "Publish Blog",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4180,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $('Config').first().json.channels.includes('facebook') }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "379c7a7f-126c-5468-870e-5f66540685c4",
+      "name": "Facebook Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        4400,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/{{ $('Config').first().json.metaGraphVersion }}/{{ $('Config').first().json.facebookPageId }}/feed",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookGraphApi",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "message",
+              "value": "={{ $('Prepare Review').first().json.content.facebook.message }}"
+            },
+            {
+              "name": "link",
+              "value": "={{ $('Prepare Review').first().json.content.facebook.link }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "9212351b-c438-5add-a6fb-2f794e46222c",
+      "name": "Publish Facebook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4620,
+        0
+      ],
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "",
+          "name": "Facebook Page token"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $('Config').first().json.channels.includes('instagram') }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "750b4be1-b5bc-5ac3-9324-64ea9f33f210",
+      "name": "Instagram Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        4840,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/{{ $('Config').first().json.metaGraphVersion }}/{{ $('Config').first().json.instagramUserId }}/media",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookGraphApi",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "image_url",
+              "value": "={{ $('Prepare Review').first().json.content.instagram.image_url }}"
+            },
+            {
+              "name": "caption",
+              "value": "={{ $('Prepare Review').first().json.content.instagram.caption }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "232e86da-d34f-5942-a5dc-767906d9a437",
+      "name": "IG Create Container",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5060,
+        0
+      ],
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "",
+          "name": "Facebook Page token"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "amount": 15,
+        "unit": "seconds"
+      },
+      "id": "0ee4df13-3259-59c5-8809-1f0378d32dd5",
+      "name": "IG Processing Delay",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        5280,
+        0
+      ],
+      "webhookId": "14662cc3-2c8c-5e39-956a-27aae6a9c642"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/{{ $('Config').first().json.metaGraphVersion }}/{{ $('Config').first().json.instagramUserId }}/media_publish",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookGraphApi",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "creation_id",
+              "value": "={{ $('IG Create Container').first().json.id }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "056b392a-d8c2-50cc-b7cd-6ca7ffa031ba",
+      "name": "IG Publish",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5500,
+        0
+      ],
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "",
+          "name": "Facebook Page token"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $('Config').first().json.channels.includes('x') }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "269d9f46-40f6-5b64-ae65-66029f5c021d",
+      "name": "X Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        5720,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.x.com/2/tweets",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "twitterOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $('Prepare Review').first().json.content.x.text }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "ef1c5214-00ee-5fa0-9da0-71fa07794bd7",
+      "name": "Publish X",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5940,
+        0
+      ],
+      "credentials": {
+        "twitterOAuth2Api": {
+          "id": "",
+          "name": "X OAuth2 (tweet.write)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Record Results\" — end of the publish chain. Each publisher runs with\n// \"On Error: Continue\", so its output is either the API response or { error }.\nconst store = $getWorkflowStaticData('global');\nstore.history = store.history || {};\nstore.log = store.log || [];\nconst review = $('Prepare Review').first().json;\n\nconst read = (name, pick) => {\n  try {\n    const item = $(name).first().json;\n    if (item.error) return { status: 'failed', error: JSON.stringify(item.error).slice(0, 500) };\n    return { status: 'published', ...pick(item) };\n  } catch (e) {\n    return { status: 'skipped' };               // node disabled or never reached\n  }\n};\nconst results = {\n  blog: read('Publish Blog', (j) => ({ url: j.url || review.content.blog.canonical_url })),\n  facebook: read('Publish Facebook', (j) => ({ id: j.id, url: j.id ? `https://www.facebook.com/${j.id}` : '' })),\n  instagram: read('IG Publish', (j) => ({ id: j.id })),\n  x: read('Publish X', (j) => ({ id: j.data && j.data.id, url: j.data ? `https://x.com/i/web/status/${j.data.id}` : '' })),\n};\nconst ok = Object.values(results).filter((r) => r.status === 'published').length;\nconst attempted = Object.values(results).filter((r) => r.status !== 'skipped').length;\nconst status = attempted === 0 ? 'no_channels' : ok === attempted ? 'published' : ok ? 'partial' : 'failed';\n\nif (ok > 0) store.history[review.slug] = new Date().toISOString();   // start cooldown\nstore.log.push({ executionId: $execution.id, slug: review.slug, status, results, at: new Date().toISOString() });\nif (store.log.length > 500) store.log = store.log.slice(-500);\n\nreturn [{ json: { status, slug: review.slug, results } }];\n"
+      },
+      "id": "15dd52c9-daec-5bb4-b949-874434b48c19",
+      "name": "Record Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6160,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegramReviewerChatId }}",
+        "text": "={{ `<b>${$json.status.toUpperCase()}</b>: ${$json.slug}\\n` + Object.entries($json.results).map(([k, v]) => `${k}: ${v.status}${v.url ? ' ' + v.url : ''}${v.error ? ' — ' + v.error.slice(0, 120) : ''}`).join('\\n') }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true,
+          "appendAttribution": false
+        }
+      },
+      "id": "67f04c43-4b6e-5e49-97bc-f08b59dcdabe",
+      "name": "Telegram Summary",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        6380,
+        100
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram reviewer bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Weekday 07:45 EAT": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Fetch Sitemap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Sitemap": {
+      "main": [
+        [
+          {
+            "node": "GSC Page Stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GSC Page Stats": {
+      "main": [
+        [
+          {
+            "node": "Select Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select Target": {
+      "main": [
+        [
+          {
+            "node": "Has Target?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Service Page": {
+      "main": [
+        [
+          {
+            "node": "Extract Facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Facts": {
+      "main": [
+        [
+          {
+            "node": "Build LLM Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build LLM Request": {
+      "main": [
+        [
+          {
+            "node": "Anthropic Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Messages": {
+      "main": [
+        [
+          {
+            "node": "Assemble + Compliance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble + Compliance": {
+      "main": [
+        [
+          {
+            "node": "Passed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Blocked Message": {
+      "main": [
+        [
+          {
+            "node": "Telegram Blocked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Blocked": {
+      "main": [
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Review": {
+      "main": [
+        [
+          {
+            "node": "Telegram Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Review": {
+      "main": [
+        [
+          {
+            "node": "Wait for Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for Decision": {
+      "main": [
+        [
+          {
+            "node": "Verify Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Decision": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign Blog Payload": {
+      "main": [
+        [
+          {
+            "node": "Publish Blog",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publish Blog": {
+      "main": [
+        [
+          {
+            "node": "Facebook Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publish Facebook": {
+      "main": [
+        [
+          {
+            "node": "Instagram Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG Create Container": {
+      "main": [
+        [
+          {
+            "node": "IG Processing Delay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG Processing Delay": {
+      "main": [
+        [
+          {
+            "node": "IG Publish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG Publish": {
+      "main": [
+        [
+          {
+            "node": "X Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publish X": {
+      "main": [
+        [
+          {
+            "node": "Record Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Results": {
+      "main": [
+        [
+          {
+            "node": "Telegram Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Target?": {
+      "main": [
+        [
+          {
+            "node": "Fetch Service Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Passed?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Review",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retry?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry?": {
+      "main": [
+        [
+          {
+            "node": "Build LLM Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Blocked Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          {
+            "node": "Blog Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Invalid Token?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Invalid Token?": {
+      "main": [
+        [
+          {
+            "node": "Wait for Decision",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Blog Enabled?": {
+      "main": [
+        [
+          {
+            "node": "Sign Blog Payload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Facebook Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Facebook Enabled?": {
+      "main": [
+        [
+          {
+            "node": "Publish Facebook",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Instagram Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Instagram Enabled?": {
+      "main": [
+        [
+          {
+            "node": "IG Create Container",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "X Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "X Enabled?": {
+      "main": [
+        [
+          {
+            "node": "Publish X",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Africa/Nairobi",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  },
+  "pinData": {},
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

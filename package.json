@@ -1,0 +1,12 @@
+{
+  "name": "cybermfukoni-n8n-engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cyber Mfukoni self-marketing engine as an importable n8n workflow",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "python3 build.py",
+    "test": "node --test tests/*.test.mjs",
+    "check": "python3 build.py && git diff --exit-code workflows/ && node --test tests/*.test.mjs"
+  }
+}
